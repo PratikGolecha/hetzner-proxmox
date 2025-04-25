@@ -83,13 +83,16 @@ download_proxmox_iso() {
 make_answer_toml() {
     echo -e "${CLR_BLUE}Making answer.toml...${CLR_RESET}"
     cat <<EOF > answer.toml
+make_answer_toml() {
+    echo -e "${CLR_BLUE}Making answer.toml...${CLR_RESET}"
+    cat <<EOF > answer.toml
 [global]
 keyboard = "en-us"
 country = "us"
-fqdn = "proxmox.example.com"
-mailto = "admin@example.com"
-timezone = "Europe/Istanbul"
-root_password = "StrongPassword123!"
+fqdn = "$FQDN"
+mailto = "$EMAIL"
+timezone = "$TIMEZONE"
+root_password = "$NEW_ROOT_PASSWORD"
 reboot_on_error = false
 
 [network]
@@ -98,7 +101,10 @@ source = "from-dhcp"
 [disk-setup]
 filesystem = "zfs"
 disk_list = ["/dev/nvme0n1"]
-zfs.raid = "single"
+EOF
+    echo -e "${CLR_GREEN}answer.toml created.${CLR_RESET}"
+}
+
 EOF
     echo -e "${CLR_GREEN}answer.toml created.${CLR_RESET}"
 }
