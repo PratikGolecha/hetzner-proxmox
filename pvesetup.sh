@@ -76,7 +76,7 @@ prepare_packages() {
 
 download_proxmox_iso() {
     echo -e "${CLR_BLUE}Downloading Proxmox ISO...${CLR_RESET}"
-    wget -O pve.iso https://cdn.proxmox.com/iso/proxmox-ve_8.1-1.iso
+    wget -O pve.iso https://enterprise.proxmox.com/iso/proxmox-ve_8.4-1.iso
     echo -e "${CLR_GREEN}Proxmox ISO downloaded.${CLR_RESET}"
 }
 
@@ -117,7 +117,6 @@ install_proxmox() {
       -cpu host -smp 4 -m 4096 \
       -boot d -cdrom ./pve-autoinstall.iso \
       -drive file=/dev/nvme0n1,format=raw,media=disk,if=virtio \
-      -drive file=/dev/nvme1n1,format=raw,media=disk,if=virtio \
       -vnc :0,password=off -monitor stdio -no-reboot
 }
 
@@ -127,7 +126,6 @@ boot_proxmox_with_port_forwarding() {
       -netdev user,id=net0,hostfwd=tcp::5555-:22 \
       -smp 4 -m 4096 \
       -drive file=/dev/nvme0n1,format=raw,media=disk,if=virtio \
-      -drive file=/dev/nvme1n1,format=raw,media=disk,if=virtio \
       > qemu_output.log 2>&1 &
 
     QEMU_PID=$!
