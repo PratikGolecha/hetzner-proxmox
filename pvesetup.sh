@@ -84,22 +84,21 @@ make_answer_toml() {
     echo -e "${CLR_BLUE}Making answer.toml...${CLR_RESET}"
     cat <<EOF > answer.toml
 [global]
-    keyboard = "en-us"
-    country = "us"
-    fqdn = "$FQDN"
-    mailto = "$EMAIL"
-    timezone = "$TIMEZONE"
-    root_password = "$NEW_ROOT_PASSWORD"
-    reboot_on_error = false
+keyboard = "en-us"
+country = "us"
+fqdn = "proxmox.example.com"
+mailto = "admin@example.com"
+timezone = "Europe/Istanbul"
+root_password = "StrongPassword123!"
+reboot_on_error = false
 
 [network]
-    source = "from-dhcp"
+source = "from-dhcp"
 
 [disk-setup]
-    filesystem = "zfs"
-    zfs.root = "rpool"
-    zfs.raid = "single"
-    disk_list = ["/dev/nvme0n1"]
+filesystem = "zfs"
+disk_list = ["/dev/nvme0n1"]
+zfs.raid = "single"
 EOF
     echo -e "${CLR_GREEN}answer.toml created.${CLR_RESET}"
 }
