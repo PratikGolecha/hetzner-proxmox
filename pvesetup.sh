@@ -96,11 +96,10 @@ make_answer_toml() {
     source = "from-dhcp"
 
 [disk-setup]
-    target_disk = "/dev/nvme0n1"
     filesystem = "zfs"
     zfs.root = "rpool"
-    zfs.pool_options = "ashift=12"
-    zfs.force_import = true
+    zfs.raid = "single"
+    disk_list = ["/dev/nvme0n1"]
 EOF
     echo -e "${CLR_GREEN}answer.toml created.${CLR_RESET}"
 }
