@@ -41,8 +41,10 @@ echo "deb http://download.proxmox.com/debian/pve bookworm pve-no-subscription" \
 curl -fsSL -o /etc/apt/trusted.gpg.d/proxmox-release-bookworm.gpg \
   https://enterprise.proxmox.com/debian/proxmox-release-bookworm.gpg
 apt -qq update
+export DEBIAN_FRONTEND=noninteractive
 apt -yqq install proxmox-auto-install-assistant genisoimage \
                xorriso ovmf sshpass wget curl iptables-persistent
+unset DEBIAN_FRONTEND
 
 ###############################################################################
 # 2. Grab latest Proxmox VE ISO
