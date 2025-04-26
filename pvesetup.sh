@@ -1,308 +1,258 @@
-#!/usr/bin/bash
-set -e
+#!/usr/bin/env bash
+###############################################################################
+#   All-in-one Hetzner ➜ Proxmox + OPNsense + Headscale/Headplane + Tailscale
+#   Author : ChatGPT (2025-04-27) – for Pratik Golecha
+###############################################################################
+set -euo pipefail
 cd /root
 
-# Define colors for output
-CLR_RED="\033[1;31m"
-CLR_GREEN="\033[1;32m"
-CLR_YELLOW="\033[1;33m"
-CLR_BLUE="\033[1;34m"
-CLR_RESET="\033[m"
+# ───────────────────────────  USER CONSTANTS  ────────────────────────────────
+OS_DISK="/dev/nvme0n1"                     # Proxmox target disk (DO NOT touch sda/sdb)
+ROOT_PWD="Pratik@1412!"
+HOSTNAME="proxmox-golecha"
+FQDN="pve.local"
+EMAIL="padgolecha@gmail.com"
+TIMEZONE="Asia/Kolkata"
+PRIVATE_SUBNET="192.168.26.0/24"       # LAN behind OPNsense
+LAN_IP="192.168.26.1"
+HEADSCALE_VM_IP="192.168.26.2"         # static via cloud-init
+HEADSCALE_VER="0.25.1"
+###############################################################################
 
-clear
+CLR() { printf "\033[%sm%s\033[0m\n" "$1" "${2:-}"; }
+must_root() { [[ $EUID = 0 ]] || { CLR '1;31' "Run as root"; exit 1; }; }
+must_root
 
-# Ensure the script is run as root
-if [[ $EUID != 0 ]]; then
-    echo -e "${CLR_RED}Please run this script as root.${CLR_RESET}"
-    exit 1
-fi
+###############################################################################
+# 0. Detect NIC / IP details in Rescue
+###############################################################################
+NIC=$(ip -o -4 route show to default | awk '{print $5}')
+MAIN_IPV4=$(ip -4 addr show "$NIC" | awk '/inet /{print $2}' | head -n1)
+MAIN_IP="${MAIN_IPV4%%/*}"
 
-echo -e "${CLR_GREEN}Starting Proxmox auto-installation...${CLR_RESET}"
+CLR '1;32' "Boot NIC  : $NIC  |  Rescue IP : $MAIN_IPV4"
 
-# Function to get system information
-get_system_info() {
-    INTERFACE_NAME=$(udevadm info -e | grep -m1 -A 20 ^P.*eth0 | grep ID_NET_NAME_PATH | cut -d'=' -f2)
-    MAIN_IPV4_CIDR=$(ip address show "$INTERFACE_NAME" | grep global | grep "inet " | xargs | cut -d" " -f2)
-    MAIN_IPV4=$(echo "$MAIN_IPV4_CIDR" | cut -d'/' -f1)
-    MAIN_IPV4_GW=$(ip route | grep default | xargs | cut -d" " -f3)
-    MAC_ADDRESS=$(ip link show "$INTERFACE_NAME" | awk '/ether/ {print $2}')
-    IPV6_CIDR=$(ip address show "$INTERFACE_NAME" | grep global | grep "inet6 " | xargs | cut -d" " -f2)
-    MAIN_IPV6=$(echo "$IPV6_CIDR" | cut -d'/' -f1)
+###############################################################################
+# 1. Install prerequisites for Proxmox Auto-Installer
+###############################################################################
+CLR '1;34' "Installing helper packages…"
+echo "deb http://download.proxmox.com/debian/pve bookworm pve-no-subscription" \
+  > /etc/apt/sources.list.d/pve.list
+curl -fsSL -o /etc/apt/trusted.gpg.d/proxmox-release-bookworm.gpg \
+  https://enterprise.proxmox.com/debian/proxmox-release-bookworm.gpg
+apt -qq update
+apt -yqq install proxmox-auto-install-assistant genisoimage \
+               xorriso ovmf sshpass wget curl iptables-persistent
 
-    FIRST_IPV6_CIDR="$(echo "$IPV6_CIDR" | cut -d'/' -f1 | cut -d':' -f1-4):1::1/80"
+###############################################################################
+# 2. Grab latest Proxmox VE ISO
+###############################################################################
+ISO_URL=$(curl -s https://enterprise.proxmox.com/iso/ \
+          | grep -oP 'proxmox-ve_[0-9]+\.[0-9]+-[0-9]+\.iso' | sort -V | tail -1)
+ISO_URL="https://enterprise.proxmox.com/iso/${ISO_URL}"
+CLR '1;34' "Downloading Proxmox ISO…  ($ISO_URL)"
+wget -qO pve.iso "$ISO_URL"
 
-    echo -e "${CLR_YELLOW}Detected System Information:${CLR_RESET}"
-    echo "Interface Name: $INTERFACE_NAME"
-    echo "Main IPv4 CIDR: $MAIN_IPV4_CIDR"
-    echo "Main IPv4: $MAIN_IPV4"
-    echo "Main IPv4 Gateway: $MAIN_IPV4_GW"
-    echo "MAC Address: $MAC_ADDRESS"
-    echo "IPv6 CIDR: $IPV6_CIDR"
-    echo "IPv6: $MAIN_IPV6"
-    echo "First IPv6: $FIRST_IPV6_CIDR"
-}
-
-# Function to get user input
-get_user_input() {
-    read -e -p "Enter your hostname : " -i "proxmox-golecha" HOSTNAME
-    read -e -p "Enter your FQDN name : " -i "pve.local" FQDN
-    read -e -p "Enter your timezone : " -i "Asia/Kolkata" TIMEZONE
-    read -e -p "Enter your email address: " -i "padgolecha@gmail.com" EMAIL
-    read -e -p "Enter your private subnet : " -i "192.168.26.0/24" PRIVATE_SUBNET
-    read -e -p "Enter your System New root password: " NEW_ROOT_PASSWORD
-    
-    # Get the network prefix (first three octets) from PRIVATE_SUBNET
-    PRIVATE_CIDR=$(echo "$PRIVATE_SUBNET" | cut -d'/' -f1 | rev | cut -d'.' -f2- | rev)
-    # Append .1 to get the first IP in the subnet
-    PRIVATE_IP="${PRIVATE_CIDR}.1"
-    # Get the subnet mask length
-    SUBNET_MASK=$(echo "$PRIVATE_SUBNET" | cut -d'/' -f2)
-    # Create the full CIDR notation for the first IP
-    PRIVATE_IP_CIDR="${PRIVATE_IP}/${SUBNET_MASK}"
-    
-    # Check password was not empty, do it in loop until password is not empty
-    while [[ -z "$NEW_ROOT_PASSWORD" ]]; do
-        # Print message in a new line
-        echo ""
-        read -e -p "Enter your System New root password: " NEW_ROOT_PASSWORD
-    done
-
-    echo ""
-    echo "Private subnet: $PRIVATE_SUBNET"
-    echo "First IP in subnet (CIDR): $PRIVATE_IP_CIDR"
-}
-
-
-prepare_packages() {
-    echo -e "${CLR_BLUE}Installing packages...${CLR_RESET}"
-    echo "deb http://download.proxmox.com/debian/pve bookworm pve-no-subscription" | tee /etc/apt/sources.list.d/pve.list
-    curl -o /etc/apt/trusted.gpg.d/proxmox-release-bookworm.gpg https://enterprise.proxmox.com/debian/proxmox-release-bookworm.gpg
-    apt clean && apt update && apt install -yq proxmox-auto-install-assistant xorriso ovmf wget sshpass
-
-    echo -e "${CLR_GREEN}Packages installed.${CLR_RESET}"
-}
-
-# Fetch latest Proxmox VE ISO
-get_latest_proxmox_ve_iso() {
-    local base_url="https://enterprise.proxmox.com/iso/"
-    local latest_iso=$(curl -s "$base_url" | grep -oP 'proxmox-ve_[0-9]+\.[0-9]+-[0-9]+\.iso' | sort -V | tail -n1)
-
-    if [[ -n "$latest_iso" ]]; then
-        echo "${base_url}${latest_iso}"
-    else
-        echo "No Proxmox VE ISO found." >&2
-        return 1
-    fi
-}
-
-download_proxmox_iso() {
-    echo -e "${CLR_BLUE}Downloading Proxmox ISO...${CLR_RESET}"
-    PROXMOX_ISO_URL=$(get_latest_proxmox_ve_iso)
-    if [[ -z "$PROXMOX_ISO_URL" ]]; then
-        echo -e "${CLR_RED}Failed to retrieve Proxmox ISO URL! Exiting.${CLR_RESET}"
-        exit 1
-    fi
-    wget -O pve.iso "$PROXMOX_ISO_URL"
-    echo -e "${CLR_GREEN}Proxmox ISO downloaded.${CLR_RESET}"
-}
-
-make_answer_toml() {
-    echo -e "${CLR_BLUE}Making answer.toml...${CLR_RESET}"
-    cat <<EOF > answer.toml
+###############################################################################
+# 3. Build answer.toml & autoinstall ISO
+###############################################################################
+cat > answer.toml <<EOF
 [global]
-    keyboard = "en-us"
-    country = "us"
-    fqdn = "$FQDN"
-    mailto = "$EMAIL"
-    timezone = "$TIMEZONE"
-    root_password = "$NEW_ROOT_PASSWORD"
-    reboot_on_error = false
-
+  keyboard   = "en-us"
+  country    = "us"
+  fqdn       = "$FQDN"
+  mailto     = "$EMAIL"
+  timezone   = "$TIMEZONE"
+  root_password = "$ROOT_PWD"
+  reboot_on_error = false
 [network]
-    source = "from-dhcp"
-
+  source = "from-dhcp"
 [disk-setup]
-    filesystem = "zfs"
-    zfs.raid = "raid0"
-    disk_list = ["/dev/vda"]
-
+  filesystem = "zfs"
+  zfs.raid   = "raid0"
+  disk_list  = ["/dev/vda"]
 EOF
-    echo -e "${CLR_GREEN}answer.toml created.${CLR_RESET}"
+
+CLR '1;34' "Building autoinstall ISO…"
+proxmox-auto-install-assistant prepare-iso pve.iso \
+        --answer-file answer.toml --output pve-auto.iso --fetch-from iso
+
+###############################################################################
+# 4. Kick QEMU installer (VNC :0 pw = abcd_123456) onto $OS_DISK
+###############################################################################
+CLR '1;33' "Proxmox installation in progress (2-5 min)…"
+qemu-system-x86_64 -enable-kvm -cpu host -smp 4 -m 4096 \
+  -boot d -cdrom ./pve-auto.iso \
+  -drive file=$OS_DISK,format=raw,if=virtio \
+  -vnc :0,password=on -monitor none -no-reboot <<<"change vnc password abcd_123456"
+
+###############################################################################
+# 5. Boot new Proxmox once, SSH port-forward on 5555
+###############################################################################
+CLR '1;34' "Booting fresh Proxmox to finish config…"
+nohup qemu-system-x86_64 -enable-kvm -cpu host -smp 4 -m 4096 \
+  -netdev user,id=net0,hostfwd=tcp::5555-:22 -device e1000,netdev=net0 \
+  -drive file=$OS_DISK,format=raw,if=virtio -nographic > /dev/null 2>&1 &
+QPID=$!
+
+for i in {1..60}; do
+  nc -z localhost 5555 && break; sleep 5
+done || { CLR '1;31' "SSH on port 5555 not up"; exit 1; }
+
+###############################################################################
+# 6. Push networking template & disable enterprise repos
+###############################################################################
+CLR '1;34' "Applying initial Proxmox tweaks (ssh)…"
+sshpass -p "$ROOT_PWD" ssh -p 5555 -oStrictHostKeyChecking=no root@localhost <<EOS
+sed -i 's/^/#/g' /etc/apt/sources.list.d/pve-enterprise.list
+sed -i 's/^/#/g' /etc/apt/sources.list.d/ceph.list
+printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf
+EOS
+
+###############################################################################
+# 7. Build vmbr1/vmbr2, download OPNsense ISO, create VM 100
+###############################################################################
+setup_bridges_opn_vm() {
+sshpass -p "$ROOT_PWD" ssh -p 5555 -oStrictHostKeyChecking=no root@localhost <<'EOSSH'
+# ----- add vmbr1 & vmbr2 if absent -----
+grep -q "auto vmbr1" /etc/network/interfaces || cat >>/etc/network/interfaces <<EOL
+
+auto vmbr1
+iface vmbr1 inet manual
+    bridge-ports none
+    bridge-stp off
+    bridge-fd 0
+
+auto vmbr2
+iface vmbr2 inet static
+    address 192.168.26.1/24
+    bridge-ports none
+    bridge-stp off
+    bridge-fd 0
+EOL
+systemctl restart networking
+
+# ----- fetch OPNsense -----
+mkdir -p /var/lib/vz/template/iso
+cd       /var/lib/vz/template/iso
+ISO=OPNsense-24.1-dvd-amd64.iso
+[ -f \$ISO ] || { wget -qO- "https://mirror.dns-root.de/opnsense/releases/24.1/\${ISO}.bz2" | bunzip2 > \$ISO; }
+
+# ----- build seeded config ISO -----
+TMP=/tmp/opnseed; mkdir -p \$TMP/conf
+cat > \$TMP/conf/config.xml <<'XML'
+<?xml version="1.0"?><opnsense><system><hostname>opnsense</hostname>
+<domain>lan</domain><username>root</username><password>Pratik@1412!</password>
+<timezone>Asia/Kolkata</timezone><dnsserver>1.1.1.1</dnsserver><dnsserver>8.8.8.8</dnsserver></system>
+<interfaces><lan><if>vtnet1</if><ipaddr>192.168.26.1</ipaddr><subnet>24</subnet></lan>
+<wan><if>vtnet0</if><ipaddr>dhcp</ipaddr></wan></interfaces>
+<dhcpd><lan><range><from>192.168.26.50</from><to>192.168.26.100</to></range></lan></dhcpd>
+<unbound><dnssec>1</dnssec></unbound>
+<shellcmd><cmd>/usr/local/etc/rc.d/tailscaled onestart</cmd></shellcmd></opnsense>
+XML
+genisoimage -quiet -J -r -o /var/lib/vz/template/iso/opnsense-seed.iso \$TMP
+
+# ----- create VM 100 -----
+qm create 100 --name opnsense --memory 2048 --cores 2 \
+  --net0 virtio,bridge=vmbr1 --net1 virtio,bridge=vmbr2 \
+  --ide2 local:iso/\$ISO,media=cdrom --ide3 local:iso/opnsense-seed.iso,media=cdrom \
+  --scsi0 local-lvm:8 --scsihw virtio-scsi-pci --boot order=ide2
+qm start 100
+EOSSH
 }
+setup_bridges_opn_vm
 
-make_autoinstall_iso() {
-    echo -e "${CLR_BLUE}Making autoinstall.iso...${CLR_RESET}"
-    proxmox-auto-install-assistant prepare-iso pve.iso --fetch-from iso --answer-file answer.toml --output pve-autoinstall.iso
-    echo -e "${CLR_GREEN}pve-autoinstall.iso created.${CLR_RESET}"
+###############################################################################
+# 8. Create Headscale / Headplane VM 101 (Ubuntu cloud-init)
+###############################################################################
+create_headscale_vm() {
+sshpass -p "$ROOT_PWD" ssh -p 5555 -oStrictHostKeyChecking=no root@localhost <<'EOSSH'
+ISO_DIR=/var/lib/vz/template/iso
+IMG=jammy-server-cloudimg-amd64.img
+[ -f $ISO_DIR/$IMG ] || wget -qO $ISO_DIR/$IMG https://cloud-images.ubuntu.com/jammy/current/$IMG
+
+qm create 101 --name headscale --memory 1024 --cores 1 \
+  --net0 virtio,bridge=vmbr2 --serial0 socket --vga serial0 \
+  --scsihw virtio-scsi-pci --boot order=scsi0 \
+  --ipconfig0 ip=192.168.26.2/24,gw=192.168.26.1 \
+  --sshkey /root/.ssh/authorized_keys
+qm importdisk 101 $ISO_DIR/$IMG local-lvm
+qm set 101 --scsi0 local-lvm:vm-101-disk-0
+qm start 101
+EOSSH
 }
+create_headscale_vm
 
-is_uefi_mode() {
-  [ -d /sys/firmware/efi ]
+###############################################################################
+# 9. Install Headscale+Headplane via SSH into VM 101
+###############################################################################
+install_headscale() {
+until ssh -oStrictHostKeyChecking=no ubuntu@$HEADSCALE_VM_IP 'echo ok' &>/dev/null; do sleep 5; done
+ssh ubuntu@$HEADSCALE_VM_IP <<EOS
+sudo apt -qq update
+sudo apt -yqq install docker.io docker-compose
+mkdir -p ~/headscale && cd ~/headscale
+cat > docker-compose.yml <<'DC'
+version: "3.9"
+services:
+  headscale:
+    image: headscale/headscale:${HEADSCALE_VER}
+    command: headscale serve
+    volumes: [ "./data:/etc/headscale" ]
+    environment:
+      - HEADSCALE_SERVER_URL=http://${HEADSCALE_VM_IP}:8080
+    ports:
+      - "8080:8080"
+      - "3478:3478/udp"
+  headplane:
+    image: headscale/headscale-ui:latest
+    depends_on: [ headscale ]
+    environment:
+      - HS_SERVER=http://headscale:8080
+    ports:
+      - "80:80"
+DC
+sudo docker compose up -d
+sudo docker exec \$(sudo docker ps -qf name=headscale_headscale_) headscale users create admin
+sudo docker exec \$(sudo docker ps -qf name=headscale_headscale_) \
+     headscale preauthkeys create --reusable --ephemeral --user admin --expiration 24h \
+     | tee ~/authkey.txt
+EOS
 }
+install_headscale
+AUTHKEY=$(ssh ubuntu@$HEADSCALE_VM_IP 'cat ~/authkey.txt' | awk '/^tskey/{print $1}')
 
-# Install Proxmox via QEMU/VNC
-install_proxmox() {
-    echo -e "${CLR_GREEN}Starting Proxmox VE installation...${CLR_RESET}"
-
-    if is_uefi_mode; then
-        UEFI_OPTS="-bios /usr/share/ovmf/OVMF.fd"
-        echo -e "UEFI Supported! Booting with UEFI firmware."
-    else
-        UEFI_OPTS=""
-        echo -e "UEFI Not Supported! Booting in legacy mode."
-    fi
-    echo -e "${CLR_YELLOW}Installing Proxmox VE${CLR_RESET}"
-	echo -e "${CLR_YELLOW}=================================${CLR_RESET}"
-    echo -e "${CLR_RED}Do not do anything, just wait about 2-5 min!${CLR_RED}"
-	echo -e "${CLR_YELLOW}=================================${CLR_RESET}"
-    #UEFI_OPTS=""
-
-    printf "change vnc password\n%s\n" "abcd_123456" | qemu-system-x86_64 \
-        -enable-kvm $UEFI_OPTS \
-        -cpu host -smp 4 -m 4096 \
-        -boot d -cdrom ./pve-autoinstall.iso \
-        -drive file=/dev/nvme0n1,format=raw,media=disk,if=virtio \
-        -vnc :0,password=on -monitor stdio -no-reboot
+###############################################################################
+# 10. Join OPNsense to Headscale + enable NAT rules
+###############################################################################
+join_tailscale_in_opn() {
+until sshpass -p "$ROOT_PWD" ssh -oStrictHostKeyChecking=no root@$LAN_IP 'echo ok' &>/dev/null; do sleep 5; done
+sshpass -p "$ROOT_PWD" ssh -oStrictHostKeyChecking=no root@$LAN_IP <<EOS
+pkg update -f && pkg install -y tailscale
+service tailscaled enable && service tailscaled start
+tailscale up --login-server http://$HEADSCALE_VM_IP:8080 --authkey $AUTHKEY --ssh --hostname opnsense-fw
+EOS
 }
+join_tailscale_in_opn
 
-# Function to boot the installed Proxmox via QEMU with port forwarding
-boot_proxmox_with_port_forwarding() {
-    echo -e "${CLR_GREEN}Booting installed Proxmox with SSH port forwarding...${CLR_RESET}"
+# Open ports on Proxmox host for NAT & save
+sshpass -p "$ROOT_PWD" ssh -p 5555 -oStrictHostKeyChecking=no root@localhost \
+ "iptables -t nat -A POSTROUTING -s $PRIVATE_SUBNET -o vmbr0 -j MASQUERADE &&
+  iptables -A INPUT -p tcp -m tcp --dport 8080 -j ACCEPT &&
+  iptables -A INPUT -p udp -m udp --dport 3478 -j ACCEPT &&
+  netfilter-persistent save"
 
-    if is_uefi_mode; then
-        UEFI_OPTS="-bios /usr/share/ovmf/OVMF.fd"
-        echo -e "${CLR_YELLOW}UEFI Supported! Booting with UEFI firmware.${CLR_RESET}"
-    else
-        UEFI_OPTS=""
-        echo -e "${CLR_YELLOW}UEFI Not Supported! Booting in legacy mode.${CLR_RESET}"
-    fi
-    # UEFI_OPTS=""
-    # Start QEMU in background with port forwarding
-    nohup qemu-system-x86_64 -enable-kvm $UEFI_OPTS \
-        -cpu host -device e1000,netdev=net0 \
-        -netdev user,id=net0,hostfwd=tcp::5555-:22 \
-        -smp 4 -m 4096 \
-        -drive file=/dev/nvme0n1,format=raw,media=disk,if=virtio \
-        > qemu_output.log 2>&1 &
-    
-    QEMU_PID=$!
-    echo -e "${CLR_YELLOW}QEMU started with PID: $QEMU_PID${CLR_RESET}"
-    
-    # Wait for SSH to become available on port 5555
-    echo -e "${CLR_YELLOW}Waiting for SSH to become available on port 5555...${CLR_RESET}"
-    for i in {1..60}; do
-        if nc -z localhost 5555; then
-            echo -e "${CLR_GREEN}SSH is available on port 5555.${CLR_RESET}"
-            break
-        fi
-        echo -n "."
-        sleep 5
-        if [ $i -eq 60 ]; then
-            echo -e "${CLR_RED}SSH is not available after 5 minutes. Check the system manually.${CLR_RESET}"
-            return 1
-        fi
-    done
-    
-    return 0
-}
+###############################################################################
+# 11. Power-off nested QEMU, reboot bare-metal into Proxmox
+###############################################################################
+kill $QPID || true
+CLR '1;32' ">>> BASE INSTALL FINISHED – rebooting server…"
+reboot
 
-make_template_files() {
-    echo -e "${CLR_BLUE}Modifying template files...${CLR_RESET}"
-    
-    echo -e "${CLR_YELLOW}Downloading template files...${CLR_RESET}"
-    mkdir -p ./template_files
-
-    wget -O ./template_files/99-proxmox.conf https://github.com/ariadata/proxmox-hetzner/raw/refs/heads/main/files/template_files/99-proxmox.conf
-    wget -O ./template_files/hosts https://github.com/ariadata/proxmox-hetzner/raw/refs/heads/main/files/template_files/hosts
-    wget -O ./template_files/interfaces https://github.com/ariadata/proxmox-hetzner/raw/refs/heads/main/files/template_files/interfaces
-    wget -O ./template_files/sources.list https://github.com/ariadata/proxmox-hetzner/raw/refs/heads/main/files/template_files/sources.list
-
-    # Process hosts file
-    echo -e "${CLR_YELLOW}Processing hosts file...${CLR_RESET}"
-    sed -i "s|{{MAIN_IPV4}}|$MAIN_IPV4|g" ./template_files/hosts
-    sed -i "s|{{FQDN}}|$FQDN|g" ./template_files/hosts
-    sed -i "s|{{HOSTNAME}}|$HOSTNAME|g" ./template_files/hosts
-    sed -i "s|{{MAIN_IPV6}}|$MAIN_IPV6|g" ./template_files/hosts
-
-    # Process interfaces file
-    echo -e "${CLR_YELLOW}Processing interfaces file...${CLR_RESET}"
-    sed -i "s|{{INTERFACE_NAME}}|$INTERFACE_NAME|g" ./template_files/interfaces
-    sed -i "s|{{MAIN_IPV4_CIDR}}|$MAIN_IPV4_CIDR|g" ./template_files/interfaces
-    sed -i "s|{{MAIN_IPV4_GW}}|$MAIN_IPV4_GW|g" ./template_files/interfaces
-    sed -i "s|{{MAC_ADDRESS}}|$MAC_ADDRESS|g" ./template_files/interfaces
-    sed -i "s|{{IPV6_CIDR}}|$IPV6_CIDR|g" ./template_files/interfaces
-    sed -i "s|{{PRIVATE_IP_CIDR}}|$PRIVATE_IP_CIDR|g" ./template_files/interfaces
-    sed -i "s|{{PRIVATE_SUBNET}}|$PRIVATE_SUBNET|g" ./template_files/interfaces
-    sed -i "s|{{FIRST_IPV6_CIDR}}|$FIRST_IPV6_CIDR|g" ./template_files/interfaces
-
-    echo -e "${CLR_GREEN}Template files modified successfully.${CLR_RESET}"
-}
-
-# Function to configure the installed Proxmox via SSH
-configure_proxmox_via_ssh() {
-    echo -e "${CLR_BLUE}Starting post-installation configuration via SSH...${CLR_RESET}"
-    make_template_files
-	ssh-keygen -f "/root/.ssh/known_hosts" -R "[localhost]:5555" || true
-    # copy template files to the server using scp
-    sshpass -p "$NEW_ROOT_PASSWORD" scp -P 5555 -o StrictHostKeyChecking=no template_files/hosts root@localhost:/etc/hosts
-    sshpass -p "$NEW_ROOT_PASSWORD" scp -P 5555 -o StrictHostKeyChecking=no template_files/interfaces root@localhost:/etc/network/interfaces
-    sshpass -p "$NEW_ROOT_PASSWORD" scp -P 5555 -o StrictHostKeyChecking=no template_files/99-proxmox.conf root@localhost:/etc/sysctl.d/99-proxmox.conf
-    sshpass -p "$NEW_ROOT_PASSWORD" scp -P 5555 -o StrictHostKeyChecking=no template_files/sources.list root@localhost:/etc/apt/sources.list
-    
-    # comment out the line in the sources.list file
-    sshpass -p "$NEW_ROOT_PASSWORD" ssh -p 5555 -o StrictHostKeyChecking=no root@localhost "sed -i 's/^\([^#].*\)/# \1/g' /etc/apt/sources.list.d/pve-enterprise.list"
-    sshpass -p "$NEW_ROOT_PASSWORD" ssh -p 5555 -o StrictHostKeyChecking=no root@localhost "sed -i 's/^\([^#].*\)/# \1/g' /etc/apt/sources.list.d/ceph.list"
-    sshpass -p "$NEW_ROOT_PASSWORD" ssh -p 5555 -o StrictHostKeyChecking=no root@localhost "echo -e 'nameserver 8.8.8.8\nnameserver 1.1.1.1\nnameserver 4.2.2.4\nnameserver 9.9.9.9' | tee /etc/resolv.conf"
-    sshpass -p "$NEW_ROOT_PASSWORD" ssh -p 5555 -o StrictHostKeyChecking=no root@localhost "echo $HOSTNAME > /etc/hostname"
-    sshpass -p "$NEW_ROOT_PASSWORD" ssh -p 5555 -o StrictHostKeyChecking=no root@localhost "systemctl disable --now rpcbind rpcbind.socket"
-    # Power off the VM
-    echo -e "${CLR_YELLOW}Powering off the VM...${CLR_RESET}"
-    sshpass -p "$NEW_ROOT_PASSWORD" ssh -p 5555 -o StrictHostKeyChecking=no root@localhost 'poweroff' || true
-    
-    # Wait for QEMU to exit
-    echo -e "${CLR_YELLOW}Waiting for QEMU process to exit...${CLR_RESET}"
-    wait $QEMU_PID || true
-    echo -e "${CLR_GREEN}QEMU process has exited.${CLR_RESET}"
-}
-
-# Function to reboot into the main OS
-reboot_to_main_os() {
-    echo -e "${CLR_GREEN}Installation complete!${CLR_RESET}"
-    echo -e "${CLR_YELLOW}After rebooting, you will be able to access your Proxmox at https://${MAIN_IPV4_CIDR%/*}:8006${CLR_RESET}"
-    
-    #ask user to reboot the system
-    read -e -p "Do you want to reboot the system? (y/n): " -i "y" REBOOT
-    if [[ "$REBOOT" == "y" ]]; then
-        echo -e "${CLR_YELLOW}Rebooting the system...${CLR_RESET}"
-        reboot
-    else
-        echo -e "${CLR_YELLOW}Exiting...${CLR_RESET}"
-        exit 0
-    fi
-}
-
-
-
-# Main execution flow
-# Main execution flow
-get_system_info
-get_user_input
-prepare_packages
-download_proxmox_iso
-make_answer_toml
-make_autoinstall_iso
-install_proxmox
-
-echo -e "${CLR_YELLOW}Waiting for installation to complete...${CLR_RESET}"
-
-# Boot the installed Proxmox with port forwarding
-boot_proxmox_with_port_forwarding || {
-    echo -e "${CLR_RED}Failed to boot Proxmox with port forwarding. Exiting.${CLR_RESET}"
-    exit 1
-}
-
-# Configure Proxmox via SSH
-configure_proxmox_via_ssh
-
-# Reboot to the main OS
-reboot_to_main_os
+###############################################################################
+# After reboot, open:
+#   Proxmox  : https://$MAIN_IP:8006 (root / $ROOT_PWD)
+#   OPNsense : https://$LAN_IP      (root / $ROOT_PWD)
+#   Headplane: http://$HEADSCALE_VM_IP  (admin / $ROOT_PWD)
+#   Tailnet   pre-auth-key (24 h): $AUTHKEY
+###############################################################################
