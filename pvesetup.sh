@@ -105,10 +105,6 @@ EOF
     echo -e "${CLR_GREEN}answer.toml created.${CLR_RESET}"
 }
 
-EOF
-    echo -e "${CLR_GREEN}answer.toml created.${CLR_RESET}"
-}
-
 make_autoinstall_iso() {
     echo -e "${CLR_BLUE}Making autoinstall.iso...${CLR_RESET}"
     proxmox-auto-install-assistant prepare-iso pve.iso --fetch-from iso --answer-file answer.toml --output pve-autoinstall.iso
