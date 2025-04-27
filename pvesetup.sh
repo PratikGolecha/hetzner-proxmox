@@ -30,13 +30,25 @@ ISO=$(curl -s https://enterprise.proxmox.com/iso/ |
       grep -oP 'proxmox-ve_[0-9]+\.[0-9]+-[0-9]+\.iso' | sort -V | tail -1)
 wget -qO pve.iso "https://enterprise.proxmox.com/iso/$ISO"
 
-cat >answer.toml <<EOF
+cat >answer.toml <<'EOF'
 [global]
-keyboard="en-us" ; country="us" ; fqdn="pve.local" ; mailto="padgolecha@gmail.com"
-timezone="$TZ"   ; root_password="$ROOT_PWD" ; reboot_on_error=false
-[network] source="from-dhcp"
-[disk-setup] filesystem="zfs" ; zfs.raid="raid0" ; disk_list=["/dev/vda"]
+keyboard        = "en-us"
+country         = "us"
+fqdn            = "pve.local"
+mailto          = "padgolecha@gmail.com"
+timezone        = "Asia/Kolkata"
+root_password   = "Pratik@1412!"
+reboot_on_error = false
+
+[network]
+source = "from-dhcp"
+
+[disk-setup]
+filesystem = "zfs"
+zfs.raid   = "raid0"
+disk_list  = ["/dev/vda"]
 EOF
+
 
 proxmox-auto-install-assistant prepare-iso pve.iso \
         --answer-file answer.toml --output auto.iso --fetch-from iso
